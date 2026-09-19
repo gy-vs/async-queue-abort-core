@@ -63,6 +63,14 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 		timeout?: number;
 	}>();
 
+	// Queued tasks waiting on each abort signal. A single shared listener per
+	// signal cancels all of them, so enqueuing many tasks bound to one signal
+	// does not accumulate abort listeners on it.
+	readonly #queuedAbortSignals = new Map<AbortSignal, {
+		listener: () => void;
+		tasks: Map<RunFunction, () => void>;
+	}>();
+
 	/**
 	Get or set the default timeout for all tasks. Can be changed at runtime.
 
@@ -449,10 +457,38 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 		};
 
 		return new Promise((resolve, reject) => {
+			// If the signal is already aborted, reject immediately instead of
+			// enqueueing a task that may sit in the queue indefinitely
+			// (for example, while the queue is paused).
+			if (options.signal?.aborted) {
+				reject(options.signal.reason);
+				this.emit('error', options.signal.reason);
+				return;
+			}
+
 			// Create a unique symbol for tracking this task
 			const taskSymbol = Symbol(`task-${options.id}`);
 
-			this.#queue.enqueue(async () => {
+			// Whether the promise was already settled by the queued-phase abort
+			// handler. Only relevant for custom queues without `remove()`,
+			// where the aborted entry is discarded when it would be dequeued.
+			let rejectedWhileQueued = false;
+
+			const run = async () => {
+				// The task is starting, so it is no longer tracked as a queued
+				// abortable task. The running phase installs its own listener.
+				if (options.signal) {
+					const entry = this.#queuedAbortSignals.get(options.signal);
+					if (entry !== undefined) {
+						entry.tasks.delete(run);
+
+						if (entry.tasks.size === 0) {
+							options.signal.removeEventListener('abort', entry.listener);
+							this.#queuedAbortSignals.delete(options.signal);
+						}
+					}
+				}
+
 				this.#pending++;
 
 				// Track this running task
@@ -507,7 +543,13 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 					this.emit('completed', result);
 				} catch (error: unknown) {
 					reject(error);
-					this.emit('error', error);
+
+					// Avoid emitting 'error' twice when the queued-phase abort
+					// handler already rejected and the stale entry could not be
+					// removed (custom queue without `remove()`).
+					if (!rejectedWhileQueued) {
+						this.emit('error', error);
+					}
 				} finally {
 					// Clean up abort event listener
 					if (eventListener) {
@@ -522,7 +564,68 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 						this.#next();
 					});
 				}
-			}, options);
+			};
+
+			if (options.signal) {
+				const {signal} = options;
+
+				// Cancels this task while it is still waiting in the queue, so
+				// the promise rejects promptly and the task never runs.
+				const abortQueuedTask = () => {
+					// If the task is no longer in the queue, it was already
+					// dequeued and the running task handles the abort itself.
+					if (this.#queue.remove && !this.#queue.remove(run)) {
+						return;
+					}
+
+					rejectedWhileQueued = true;
+					reject(signal.reason);
+					this.emit('error', signal.reason);
+
+					// Keep waiters and rate-limit state in sync, mirroring clear().
+					// This intentionally does not start new tasks, so aborting a
+					// queued task never resumes a paused queue.
+					this.#updateRateLimitState();
+
+					if (this.#queue.size === 0) {
+						this.#clearIntervalTimer();
+						this.emit('empty');
+
+						if (this.#pending === 0) {
+							this.#clearTimeoutTimer();
+							this.emit('idle');
+						}
+					}
+
+					this.emit('next');
+				};
+
+				let entry = this.#queuedAbortSignals.get(signal);
+				if (entry === undefined) {
+					const tasks = new Map<RunFunction, () => void>();
+					const listener = () => {
+						this.#queuedAbortSignals.delete(signal);
+						// Keep add/remove balanced even though `once` auto-removes
+						signal.removeEventListener('abort', listener);
+
+						// Tasks that start running while this dispatch is in
+						// progress remove themselves from the map and are skipped
+						for (const abort of tasks.values()) {
+							abort();
+						}
+
+						tasks.clear();
+					};
+
+					entry = {listener, tasks};
+					this.#queuedAbortSignals.set(signal, entry);
+					signal.addEventListener('abort', listener, {once: true});
+				}
+
+				entry.tasks.set(run, abortQueuedTask);
+			}
+
+			this.#queue.enqueue(run, options);
 
 			this.emit('add');
 
@@ -572,6 +675,15 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 	*/
 	clear(): void {
 		this.#queue = new this.#queueClass();
+
+		// Stop tracking queued abortable tasks so the shared signal listeners
+		// do not leak. The promises of cleared tasks remain pending, as before.
+		for (const [signal, entry] of this.#queuedAbortSignals) {
+			signal.removeEventListener('abort', entry.listener);
+			entry.tasks.clear();
+		}
+
+		this.#queuedAbortSignals.clear();
 
 		// Clear interval timer since queue is now empty (consistent with #tryToStartAnother)
 		this.#clearIntervalTimer();

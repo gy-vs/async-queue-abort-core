@@ -45,6 +45,17 @@ export default class PriorityQueue implements Queue<RunFunction, PriorityQueueOp
 		return item?.run;
 	}
 
+	remove(run: RunFunction): boolean {
+		const index = this.#queue.findIndex((element: Readonly<{run: RunFunction}>) => element.run === run);
+
+		if (index === -1) {
+			return false;
+		}
+
+		this.#queue.splice(index, 1);
+		return true;
+	}
+
 	filter(options: Readonly<Partial<PriorityQueueOptions>>): RunFunction[] {
 		return this.#queue.filter((element: Readonly<PriorityQueueOptions>) => element.priority === options.priority).map((element: Readonly<{run: RunFunction}>) => element.run);
 	}
