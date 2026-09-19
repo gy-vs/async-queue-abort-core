@@ -55,6 +55,10 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 	// Use to assign a unique identifier to a promise function, if not explicitly specified
 	#idAssigner = 1n;
 
+	// Cleanup functions for abort listeners of tasks still waiting in the queue,
+	// so they can be removed when the task starts, is aborted, or the queue is cleared
+	readonly #queuedTaskAbortCleanups = new Set<() => void>();
+
 	// Track currently running tasks for debugging
 	readonly #runningTasks = new Map<symbol, {
 		id?: string;
@@ -286,24 +290,7 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 
 	#tryToStartAnother(): boolean {
 		if (this.#queue.size === 0) {
-			// We can clear the interval ("pause")
-			// Because we can redo it later ("resume")
-			this.#clearIntervalTimer();
-			this.emit('empty');
-
-			if (this.#pending === 0) {
-				// Clear timeout as well when completely idle
-				this.#clearTimeoutTimer();
-
-				// Compact strict ticks when idle to free memory
-				if (this.#strict && this.#strictTicksStartIndex > 0) {
-					const now = Date.now();
-					this.#cleanupStrictTicks(now);
-				}
-
-				this.emit('idle');
-			}
-
+			this.#handleEmptyQueue();
 			return false;
 		}
 
@@ -333,6 +320,37 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 		}
 
 		return taskStarted;
+	}
+
+	#handleEmptyQueue(): void {
+		// We can clear the interval ("pause")
+		// Because we can redo it later ("resume")
+		this.#clearIntervalTimer();
+		this.emit('empty');
+
+		if (this.#pending === 0) {
+			// Clear timeout as well when completely idle
+			this.#clearTimeoutTimer();
+
+			// Compact strict ticks when idle to free memory
+			if (this.#strict && this.#strictTicksStartIndex > 0) {
+				const now = Date.now();
+				this.#cleanupStrictTicks(now);
+			}
+
+			this.emit('idle');
+		}
+	}
+
+	// Bookkeeping after a queued task is removed before it could start.
+	// Unlike `#tryToStartAnother`, this never starts new tasks: removing a queued
+	// task frees no concurrency slot and must not unpause the queue.
+	#onQueuedTaskRemoval(): void {
+		this.#scheduleRateLimitUpdate();
+
+		if (this.#queue.size === 0) {
+			this.#handleEmptyQueue();
+		}
 	}
 
 	#initializeIntervalIfNeeded(): void {
@@ -452,7 +470,14 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 			// Create a unique symbol for tracking this task
 			const taskSymbol = Symbol(`task-${options.id}`);
 
-			this.#queue.enqueue(async () => {
+			// Removes the abort listener that watches the signal while the task waits in the queue
+			let removeQueuedAbortListener: (() => void) | undefined;
+
+			const task = async () => {
+				// The task left the queue, so the queued-phase abort listener is no longer needed.
+				// Aborts while running are handled by the `Promise.race` below.
+				removeQueuedAbortListener?.();
+
 				this.#pending++;
 
 				// Track this running task
@@ -522,7 +547,40 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 						this.#next();
 					});
 				}
-			}, options);
+			};
+
+			const {signal} = options;
+
+			if (signal?.aborted) {
+				// Already aborted: reject immediately without ever enqueueing the task
+				reject(signal.reason);
+				return;
+			}
+
+			if (signal) {
+				const onQueuedAbort = () => {
+					removeQueuedAbortListener?.();
+
+					// Remove only this task from the queue. It is matched by identity,
+					// not `id`, so tasks sharing the same `id` are left untouched.
+					if (this.#queue.remove(task)) {
+						reject(signal.reason);
+						this.#onQueuedTaskRemoval();
+					}
+				};
+
+				const cleanup = () => {
+					signal.removeEventListener('abort', onQueuedAbort);
+					this.#queuedTaskAbortCleanups.delete(cleanup);
+				};
+
+				removeQueuedAbortListener = cleanup;
+
+				signal.addEventListener('abort', onQueuedAbort, {once: true});
+				this.#queuedTaskAbortCleanups.add(cleanup);
+			}
+
+			this.#queue.enqueue(task, options);
 
 			this.emit('add');
 
@@ -572,6 +630,12 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 	*/
 	clear(): void {
 		this.#queue = new this.#queueClass();
+
+		// Remove abort listeners of the dropped queued tasks so they cannot
+		// fire (or be retained by the signal) after the tasks are gone
+		for (const cleanup of this.#queuedTaskAbortCleanups) {
+			cleanup();
+		}
 
 		// Clear interval timer since queue is now empty (consistent with #tryToStartAnother)
 		this.#clearIntervalTimer();

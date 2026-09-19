@@ -410,14 +410,19 @@ test('pending promises with abortions counted fast enough', async () => {
 	});
 
 	controller.abort();
+
+	// The queued task is removed and rejects immediately, even while the queue is paused
+	await assert.rejects(abortedPromise);
+	assert.equal(queue.size, 3);
+
 	queue.start();
 
 	await delay(100);
 
 	assert.ok(!hasThirdRun);
-	await assert.rejects(abortedPromise);
 
-	await delay(100);
+	// The next queued task runs once a concurrency slot frees up
+	await delay(1000);
 
 	assert.ok(hasThirdRun);
 });

@@ -6,4 +6,5 @@ export type Queue<Element, Options> = {
 	dequeue: () => Element | undefined;
 	enqueue: (run: Element, options?: Partial<Options>) => void;
 	setPriority: (id: string, priority: number) => void;
+	remove: (run: Element) => boolean;
 };
